@@ -1,0 +1,272 @@
+"""NiceGUI-based annotation interface."""
+
+import io
+import base64
+from pathlib import Path
+from typing import Optional, List
+from nicegui import ui, events
+from PIL import Image
+import numpy as np
+
+from core.segmentation import SegmentationImage
+from core.mapping import ROADMapping
+from data.ade20k_labels import get_label_name
+
+
+class AnnotationUI:
+    """Main annotation interface."""
+
+    def __init__(self, image_dir: str, output_dir: str = "output"):
+        """
+        Initialize annotation UI.
+
+        Args:
+            image_dir: Directory containing images
+            output_dir: Directory for output files
+        """
+        self.image_dir = Path(image_dir)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load images
+        self.image_files = sorted(list(self.image_dir.glob("*.jpg")) +
+                                 list(self.image_dir.glob("*.png")))
+        if not self.image_files:
+            raise ValueError(f"No images found in {image_dir}")
+
+        self.current_index = 0
+        self.current_seg_image: Optional[SegmentationImage] = None
+
+        # Mapping
+        mapping_file = self.output_dir / "road_mapping.json"
+        self.mapping = ROADMapping(str(mapping_file))
+
+        # UI state
+        self.selected_label: Optional[str] = None
+        self.selected_label_id: Optional[int] = None
+
+        # UI components (will be created in create_ui)
+        self.image_display = None
+        self.label_info_card = None
+        self.road_labels_list = None
+        self.page_label = None
+
+    def create_ui(self):
+        """Create the NiceGUI interface."""
+        ui.page_title("JetRacer ROAD Annotation Tool")
+
+        with ui.header().classes('items-center justify-between'):
+            ui.label('JetRacer ROAD Annotation Tool').classes('text-h4')
+            ui.label(f'Images: {len(self.image_files)}').classes('text-subtitle1')
+
+        with ui.row().classes('w-full gap-4 p-4'):
+            # Left panel: Image display
+            with ui.card().classes('w-2/3'):
+                ui.label('Segmentation Image (Click to select label)').classes('text-h6 mb-2')
+
+                # Image container
+                with ui.column().classes('items-center'):
+                    self.image_display = ui.interactive_image().classes('w-full')
+                    self.image_display.on('click', self._handle_image_click)
+
+            # Right panel: Controls and info
+            with ui.column().classes('w-1/3 gap-4'):
+                # Selected label info
+                with ui.card():
+                    ui.label('Selected Label').classes('text-h6 mb-2')
+                    self.label_info_card = ui.column()
+                    with self.label_info_card:
+                        ui.label('Click on image to select').classes('text-grey')
+
+                # ROAD labels list
+                with ui.card().classes('max-h-96 overflow-auto'):
+                    ui.label('ROAD Labels').classes('text-h6 mb-2')
+                    self.road_labels_list = ui.column()
+
+        # Bottom navigation
+        with ui.footer().classes('bg-primary text-white p-4'):
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.button('Previous', on_click=self._previous_image, icon='arrow_back')
+
+                self.page_label = ui.label()
+
+                ui.button('Next', on_click=self._next_image, icon='arrow_forward')
+
+                ui.button('Save Mapping', on_click=self._save_mapping,
+                         icon='save', color='green')
+
+        # Load first image
+        self._load_current_image()
+        self._update_road_labels_display()
+
+    def _load_current_image(self):
+        """Load and display the current image."""
+        image_path = self.image_files[self.current_index]
+
+        # Try to find corresponding segmentation file
+        seg_path = None
+        potential_seg_path = image_path.parent / f"{image_path.stem}_seg.png"
+        if potential_seg_path.exists():
+            seg_path = str(potential_seg_path)
+
+        # Load segmentation image
+        self.current_seg_image = SegmentationImage(
+            image_path=str(image_path),
+            seg_path=seg_path  # Use real segmentation if available
+        )
+        self.current_seg_image.load()
+
+        # Get road label IDs
+        road_label_ids = set()
+        for label_name in self.mapping.get_road_labels():
+            # Find label ID from name
+            from data.ade20k_labels import ADE20K_LABELS
+            for lid, lname in ADE20K_LABELS.items():
+                if lname == label_name:
+                    road_label_ids.add(lid)
+                    break
+
+        # Create display image with ROAD overlay
+        if road_label_ids:
+            display_img = self.current_seg_image.apply_road_overlay(road_label_ids)
+        else:
+            display_img = self.current_seg_image.get_blended_image(alpha=0.6)
+
+        # Convert to base64 for display
+        self._update_image_display(display_img)
+
+        # Update page label
+        self.page_label.set_text(
+            f'Image {self.current_index + 1} / {len(self.image_files)} - {image_path.name}'
+        )
+
+    def _update_image_display(self, img: Image.Image):
+        """Update the image display with a PIL Image."""
+        # Convert PIL Image to base64
+        buffered = io.BytesIO()
+        img.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+
+        # Update interactive image
+        self.image_display.set_source(f'data:image/png;base64,{img_str}')
+
+    def _handle_image_click(self, e):
+        """Handle click on image to select label."""
+        if not self.current_seg_image:
+            return
+
+        # Get click coordinates from event args
+        # NiceGUI interactive_image sends coordinates in e.args
+        if not hasattr(e, 'args') or not e.args:
+            return
+
+        img_width, img_height = self.current_seg_image.image.size
+
+        # e.args contains the click event data
+        # Extract relative coordinates (0-1 range)
+        if 'image_x' in e.args and 'image_y' in e.args:
+            x = int(e.args['image_x'] * img_width)
+            y = int(e.args['image_y'] * img_height)
+        else:
+            # Fallback: use pixel coordinates if available
+            x = int(e.args.get('offsetX', 0))
+            y = int(e.args.get('offsetY', 0))
+
+        # Get label at position
+        label_id = self.current_seg_image.get_label_at_position(x, y)
+        label_name = get_label_name(label_id)
+
+        # Update selected label
+        self.selected_label = label_name
+        self.selected_label_id = label_id
+
+        # Update label info display
+        self._update_label_info()
+
+    def _update_label_info(self):
+        """Update the selected label info card."""
+        self.label_info_card.clear()
+
+        with self.label_info_card:
+            if self.selected_label:
+                ui.label(f'Label: {self.selected_label}').classes('text-bold')
+                ui.label(f'ID: {self.selected_label_id}').classes('text-caption')
+
+                is_road = self.mapping.is_road(self.selected_label)
+                status = 'ROAD' if is_road else 'NOT ROAD'
+                color = 'green' if is_road else 'grey'
+
+                ui.label(f'Status: {status}').classes(f'text-bold text-{color}')
+
+                # Toggle button
+                ui.button(
+                    'Toggle ROAD' if not is_road else 'Remove from ROAD',
+                    on_click=self._toggle_current_label,
+                    color='primary' if not is_road else 'red'
+                ).classes('mt-2')
+            else:
+                ui.label('Click on image to select').classes('text-grey')
+
+    def _toggle_current_label(self):
+        """Toggle ROAD status of currently selected label."""
+        if not self.selected_label:
+            ui.notify('No label selected', type='warning')
+            return
+
+        # Toggle in mapping
+        new_state = self.mapping.toggle_road(self.selected_label)
+
+        # Show notification
+        status = 'ROAD' if new_state else 'NOT ROAD'
+        ui.notify(f'{self.selected_label} is now {status}', type='positive')
+
+        # Refresh displays
+        self._update_label_info()
+        self._update_road_labels_display()
+        self._load_current_image()  # Refresh to show new overlay
+
+    def _update_road_labels_display(self):
+        """Update the ROAD labels list."""
+        self.road_labels_list.clear()
+
+        with self.road_labels_list:
+            road_labels = sorted(self.mapping.get_road_labels())
+
+            if road_labels:
+                for label_name in road_labels:
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('check_circle', color='green')
+                        ui.label(label_name)
+            else:
+                ui.label('No ROAD labels yet').classes('text-grey')
+
+            # Stats
+            stats = self.mapping.get_stats()
+            ui.separator()
+            ui.label(f"Total: {stats['road_labels']} ROAD labels").classes('text-caption mt-2')
+
+    def _previous_image(self):
+        """Navigate to previous image."""
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._load_current_image()
+            self.selected_label = None
+            self.selected_label_id = None
+            self._update_label_info()
+
+    def _next_image(self):
+        """Navigate to next image."""
+        if self.current_index < len(self.image_files) - 1:
+            self.current_index += 1
+            self._load_current_image()
+            self.selected_label = None
+            self.selected_label_id = None
+            self._update_label_info()
+
+    def _save_mapping(self):
+        """Save the current mapping to file."""
+        try:
+            self.mapping.save()
+            ui.notify('Mapping saved successfully!', type='positive')
+        except Exception as e:
+            ui.notify(f'Error saving mapping: {e}', type='negative')
