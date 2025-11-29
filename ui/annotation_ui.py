@@ -28,9 +28,13 @@ class AnnotationUI:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load images
-        self.image_files = sorted(list(self.image_dir.glob("*.jpg")) +
-                                 list(self.image_dir.glob("*.png")))
+        # Load images (exclude segmentation files)
+        all_images = list(self.image_dir.glob("*.jpg")) + list(self.image_dir.glob("*.png"))
+        # Filter out segmentation files (*_seg.png)
+        self.image_files = sorted([
+            img for img in all_images
+            if not img.name.endswith('_seg.png')
+        ])
         if not self.image_files:
             raise ValueError(f"No images found in {image_dir}")
 
