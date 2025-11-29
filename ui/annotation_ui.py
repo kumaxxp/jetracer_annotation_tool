@@ -63,18 +63,22 @@ class AnnotationUI:
             ui.label('JetRacer ROAD Annotation Tool').classes('text-h4')
             ui.label(f'Images: {len(self.image_files)}').classes('text-subtitle1')
 
-        with ui.row().classes('w-full gap-4 p-4'):
-            # Left panel: Image display
-            with ui.card().classes('w-2/3'):
-                ui.label('Segmentation Image (Click to select label)').classes('text-h6 mb-2')
-
-                # Image container
-                with ui.column().classes('items-center'):
+        with ui.row().classes('w-full gap-2 p-2 items-start'):
+            # Left panel: Segmentation Image (clickable)
+            with ui.column().classes('flex-1'):
+                with ui.card():
+                    ui.label('Segmentation Image (Click to select label)').classes('text-h6 mb-2')
                     self.image_display = ui.interactive_image().classes('w-full')
                     self.image_display.on('click', self._handle_image_click)
 
+            # Middle panel: Original + Overlay
+            with ui.column().classes('flex-1'):
+                with ui.card():
+                    ui.label('Original + Segmentation Overlay').classes('text-h6 mb-2')
+                    self.overlay_display = ui.interactive_image().classes('w-full')
+
             # Right panel: Controls and info
-            with ui.column().classes('w-1/3 gap-4'):
+            with ui.column().classes('flex-1 gap-2'):
                 # Selected label info
                 with ui.card():
                     ui.label('Selected Label').classes('text-h6 mb-2')
@@ -136,8 +140,12 @@ class AnnotationUI:
         else:
             display_img = self.current_seg_image.get_blended_image(alpha=0.6)
 
+        # Create overlay image (original + segmentation blend)
+        overlay_img = self.current_seg_image.get_blended_image(alpha=0.5)
+
         # Convert to base64 for display
         self._update_image_display(display_img)
+        self._update_overlay_display(overlay_img)
 
         # Update page label
         self.page_label.set_text(
@@ -153,6 +161,20 @@ class AnnotationUI:
 
         # Update interactive image
         self.image_display.set_source(f'data:image/png;base64,{img_str}')
+
+    def _update_overlay_display(self, img: Image.Image):
+        """Update the overlay display with a PIL Image."""
+        try:
+            # Convert PIL Image to base64
+            buffered = io.BytesIO()
+            img.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
+            # Update overlay image
+            if hasattr(self, 'overlay_display') and self.overlay_display:
+                self.overlay_display.set_source(f'data:image/png;base64,{img_str}')
+        except Exception as e:
+            print(f"Error updating overlay display: {e}")
 
     def _handle_image_click(self, e):
         """Handle click on image to select label."""
