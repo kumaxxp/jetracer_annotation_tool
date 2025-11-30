@@ -10,6 +10,7 @@ import numpy as np
 
 from core.segmentation import SegmentationImage
 from core.mapping import ROADMapping
+from core.training_export import export_training_data
 from data.ade20k_labels import get_label_name
 
 
@@ -102,6 +103,9 @@ class AnnotationUI:
 
                 ui.button('Save Mapping', on_click=self._save_mapping,
                          icon='save', color='green')
+
+                ui.button('Export Training Data', on_click=self._export_training_data,
+                         icon='upload', color='orange')
 
         # Load first image
         self._load_current_image()
@@ -296,3 +300,37 @@ class AnnotationUI:
             ui.notify('Mapping saved successfully!', type='positive')
         except Exception as e:
             ui.notify(f'Error saving mapping: {e}', type='negative')
+
+    def _export_training_data(self):
+        """Export training dataset with train/val split."""
+        try:
+            # Check if any ROAD labels are defined
+            road_labels = self.mapping.get_road_labels()
+            if not road_labels:
+                ui.notify('No ROAD labels defined. Please annotate first.', type='warning')
+                return
+
+            # Save mapping first
+            self.mapping.save()
+
+            # Export dataset
+            output_dir = self.output_dir / "training_data"
+            ui.notify('Exporting training data...', type='info')
+
+            num_train, num_val = export_training_data(
+                image_files=self.image_files,
+                road_mapping=self.mapping.mapping,
+                output_dir=output_dir,
+                train_ratio=0.8,
+                random_seed=42
+            )
+
+            ui.notify(
+                f'✓ Export complete! Train: {num_train}, Val: {num_val}',
+                type='positive'
+            )
+
+        except Exception as e:
+            ui.notify(f'Error exporting: {e}', type='negative')
+            import traceback
+            traceback.print_exc()
