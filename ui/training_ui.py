@@ -15,7 +15,9 @@ import segmentation_models_pytorch as smp
 from core.model_trainer import ROADTrainer
 from core.onnx_inference import ONNXSegmenter
 from core.pytorch_inference import PyTorchSegmenter
-from data.ade20k_labels import ADE20K_COLORS
+from core.segmentation import SegmentationImage
+from core.mapping import ROADMapping
+from data.ade20k_labels import ADE20K_COLORS, ADE20K_LABELS
 
 
 class TrainingTestingUI:
@@ -39,12 +41,16 @@ class TrainingTestingUI:
         self.test_images: list = []
         self.current_test_index = 0
 
+        # Load ROAD mapping for display
+        mapping_file = Path("output/road_mapping.json")
+        self.road_mapping = ROADMapping(str(mapping_file)) if mapping_file.exists() else None
+
         # UI components (created in create_ui)
         self.train_log = None
         self.train_button = None
         self.test_images_select = None
         self.ade20k_display = None
-        self.ground_truth_display = None
+        self.overlay_display = None
         self.prediction_display = None
         self.inference_time_label = None
 
@@ -154,16 +160,16 @@ class TrainingTestingUI:
                     ui.label('ADE20K Segmentation (OneFormer)').classes('text-h6 mb-2')
                     self.ade20k_display = ui.interactive_image().classes('w-full')
 
-            # Middle: Ground Truth
+            # Middle: Original + Prediction Overlay
             with ui.column().classes('flex-1'):
                 with ui.card():
-                    ui.label('Ground Truth (Annotation)').classes('text-h6 mb-2')
-                    self.ground_truth_display = ui.interactive_image().classes('w-full')
+                    ui.label('Original + Prediction Overlay').classes('text-h6 mb-2')
+                    self.overlay_display = ui.interactive_image().classes('w-full')
 
-            # Right: Prediction
+            # Right: Prediction Mask
             with ui.column().classes('flex-1'):
                 with ui.card():
-                    ui.label('Prediction (Trained Model)').classes('text-h6 mb-2')
+                    ui.label('Prediction Mask').classes('text-h6 mb-2')
                     self.prediction_display = ui.interactive_image().classes('w-full')
 
         # Performance metrics
@@ -220,14 +226,12 @@ class TrainingTestingUI:
                 onnx_path = output_dir / "road_segmentation.onnx"
                 self.trainer.export_onnx(onnx_path)
                 self.train_log.push(f"✓ Model exported to {onnx_path}")
-
-                ui.notify('Training complete!', type='positive')
+                self.train_log.push("\n✓ Training complete!")
 
             except Exception as e:
                 self.train_log.push(f"\n✗ Training failed: {e}")
                 import traceback
                 traceback.print_exc()
-                ui.notify(f'Training error: {e}', type='negative')
 
             finally:
                 self.is_training = False
@@ -310,30 +314,40 @@ class TrainingTestingUI:
             # Get current image
             img_path = self.test_images[self.current_test_index]
 
-            # 1. Load ADE20K segmentation
+            # 1. Load ADE20K segmentation with ROAD overlay (same as annotation tool)
             seg_path = img_path.parent / f"{img_path.stem}_seg.png"
-            if seg_path.exists():
+            if seg_path.exists() and self.road_mapping:
+                # Use SegmentationImage class to apply ROAD overlay
+                seg_image = SegmentationImage(
+                    image_path=str(img_path),
+                    seg_path=str(seg_path)
+                )
+                seg_image.load()
+
+                # Get ROAD label IDs
+                road_label_ids = set()
+                for label_name in self.road_mapping.get_road_labels():
+                    for lid, lname in ADE20K_LABELS.items():
+                        if lname == label_name:
+                            road_label_ids.add(lid)
+                            break
+
+                # Apply ROAD overlay (same as annotation tool)
+                if road_label_ids:
+                    display_img = seg_image.apply_road_overlay(road_label_ids)
+                else:
+                    display_img = seg_image.get_blended_image(alpha=0.6)
+
+                self._update_display(self.ade20k_display, display_img)
+            elif seg_path.exists():
+                # Fallback: simple colorization if no ROAD mapping
                 ade20k_seg = Image.open(seg_path)
                 ade20k_colored = self._colorize_segmentation(np.array(ade20k_seg))
                 self._update_display(self.ade20k_display, ade20k_colored)
             else:
                 ui.notify('ADE20K segmentation not found', type='warning')
 
-            # 2. Load Ground Truth
-            gt_path = img_path.parent.parent / "labels" / f"{img_path.stem}.png"
-            if gt_path.exists():
-                gt_mask = Image.open(gt_path)
-                gt_colored = self._colorize_binary_mask(np.array(gt_mask))
-                self._update_display(self.ground_truth_display, gt_colored)
-            else:
-                # Try training_data directory structure
-                alt_gt_path = Path("output/training_data/val/labels") / f"{img_path.stem}.png"
-                if alt_gt_path.exists():
-                    gt_mask = Image.open(alt_gt_path)
-                    gt_colored = self._colorize_binary_mask(np.array(gt_mask))
-                    self._update_display(self.ground_truth_display, gt_colored)
-
-            # 3. Run model inference
+            # 2. Run model inference
             # Check if model is .pth (PyTorch) or .onnx
             if self.model_path.suffix == '.pth':
                 # Use PyTorch inference
@@ -341,7 +355,7 @@ class TrainingTestingUI:
                     encoder_name="mobilenet_v2",
                     encoder_weights=None,  # Don't use pretrained
                     in_channels=3,
-                    classes=1
+                    classes=3  # 3-class segmentation: Other, ROAD, MYCAR
                 )
                 segmenter = PyTorchSegmenter(
                     str(self.model_path),
@@ -356,8 +370,13 @@ class TrainingTestingUI:
             image = cv2.imread(str(img_path))
             pred_mask, inference_time = segmenter.inference(image)
 
+            # Display prediction mask (right)
             pred_colored = self._colorize_binary_mask(pred_mask)
             self._update_display(self.prediction_display, pred_colored)
+
+            # Create and display original + prediction overlay (middle)
+            overlay_img = self._create_prediction_overlay(image, pred_mask)
+            self._update_display(self.overlay_display, overlay_img)
 
             # Update metrics
             fps = 1000.0 / inference_time if inference_time > 0 else 0
@@ -384,15 +403,44 @@ class TrainingTestingUI:
         return Image.fromarray(colored)
 
     def _colorize_binary_mask(self, mask: np.ndarray) -> Image.Image:
-        """Colorize binary mask (ROAD = green, non-ROAD = black)."""
+        """Colorize multiclass mask (0: Other=black, 1: ROAD=green, 2: MYCAR=orange)."""
         h, w = mask.shape if mask.ndim == 2 else mask.shape[:2]
         colored = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # ROAD pixels = green
-        road_pixels = mask > 127
-        colored[road_pixels] = [0, 255, 0]  # Green
+        # Class 0: Other - black (already 0)
+        # Class 1: ROAD - green
+        colored[mask == 1] = [0, 255, 0]  # Green (RGB)
+        # Class 2: MYCAR - orange
+        colored[mask == 2] = [255, 128, 0]  # Orange (RGB)
 
         return Image.fromarray(colored)
+
+    def _create_prediction_overlay(self, bgr_image: np.ndarray, pred_mask: np.ndarray, alpha: float = 0.5) -> Image.Image:
+        """
+        Create overlay of prediction mask on original image.
+
+        Args:
+            bgr_image: Original BGR image from cv2.imread
+            pred_mask: Multiclass mask (0: Other, 1: ROAD, 2: MYCAR)
+            alpha: Transparency (0.0-1.0)
+
+        Returns:
+            PIL Image with overlay
+        """
+        # Convert BGR to RGB
+        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+
+        # Create colored overlay
+        overlay = np.zeros_like(rgb_image)
+        # Class 1: ROAD - green
+        overlay[pred_mask == 1] = [0, 255, 0]  # Green
+        # Class 2: MYCAR - orange
+        overlay[pred_mask == 2] = [255, 128, 0]  # Orange
+
+        # Blend original + overlay
+        blended = cv2.addWeighted(rgb_image, 1 - alpha, overlay, alpha, 0)
+
+        return Image.fromarray(blended)
 
     def _update_display(self, display_widget, img: Image.Image):
         """Update image display widget."""

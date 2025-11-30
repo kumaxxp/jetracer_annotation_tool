@@ -43,16 +43,23 @@ class ROADDataset(Dataset):
         label_path = self.label_dir / f"{img_path.stem}.png"
         label = np.array(Image.open(label_path).convert('L'))
 
-        # Convert to binary (0 or 1)
-        label = (label > 127).astype(np.float32)
+        # Label is already multiclass (0, 1, 2)
+        # 0: Other, 1: ROAD, 2: MYCAR
+        label = label.astype(np.int64)
 
         # Apply transforms
         if self.transform:
             transformed = self.transform(image=image, mask=label)
             image = transformed['image']
             label = transformed['mask']
+            # Ensure label is Long (int64) for CrossEntropyLoss
+            # After ToTensorV2, label is torch.Tensor, not numpy
+            if isinstance(label, np.ndarray):
+                label = label.astype(np.int64)
+            elif torch.is_tensor(label):
+                label = label.long()
 
-        return image, label.unsqueeze(0)  # Add channel dimension
+        return image, label  # No channel dimension for CrossEntropyLoss
 
 
 def get_transforms(input_size: Tuple[int, int] = (320, 240), is_train: bool = True):
@@ -108,8 +115,8 @@ class ROADTrainer:
             encoder_name=encoder_name,
             encoder_weights='imagenet',
             in_channels=3,
-            classes=1,  # Binary segmentation
-            activation=None  # We'll use BCEWithLogitsLoss
+            classes=3,  # 3-class segmentation: Other, ROAD, MYCAR
+            activation=None  # We'll use CrossEntropyLoss
         )
         self.model.to(self.device)
 
@@ -170,7 +177,7 @@ class ROADTrainer:
         )
 
         # Loss and optimizer
-        self.criterion = nn.BCEWithLogitsLoss()
+        self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
 
         # Training loop

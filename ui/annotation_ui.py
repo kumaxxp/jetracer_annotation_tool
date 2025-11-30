@@ -11,7 +11,9 @@ import numpy as np
 from core.segmentation import SegmentationImage
 from core.mapping import ROADMapping
 from core.training_export import export_training_data
+from core.vehicle_mask_generator import VehicleMaskGenerator
 from data.ade20k_labels import get_label_name
+import cv2
 
 
 class AnnotationUI:
@@ -49,6 +51,10 @@ class AnnotationUI:
         # UI state
         self.selected_label: Optional[str] = None
         self.selected_label_id: Optional[int] = None
+
+        # Vehicle mask
+        self.vehicle_mask: Optional[np.ndarray] = None
+        self.vehicle_mask_path = self.output_dir / "vehicle_mask.png"
 
         # UI components (will be created in create_ui)
         self.image_display = None
@@ -106,6 +112,9 @@ class AnnotationUI:
 
                 ui.button('Export Training Data', on_click=self._export_training_data,
                          icon='upload', color='orange')
+
+                ui.button('Generate Vehicle Mask', on_click=self._generate_vehicle_mask,
+                         icon='directions_car', color='purple')
 
         # Load first image
         self._load_current_image()
@@ -322,7 +331,8 @@ class AnnotationUI:
                 road_mapping=self.mapping.mapping,
                 output_dir=output_dir,
                 train_ratio=0.8,
-                random_seed=42
+                random_seed=42,
+                vehicle_mask_path=self.vehicle_mask_path if self.vehicle_mask_path.exists() else None
             )
 
             ui.notify(
@@ -334,3 +344,66 @@ class AnnotationUI:
             ui.notify(f'Error exporting: {e}', type='negative')
             import traceback
             traceback.print_exc()
+
+    def _generate_vehicle_mask(self):
+        """Generate vehicle mask from all images."""
+        try:
+            ui.notify('Generating vehicle mask...', type='info')
+
+            # Generate mask using proven parameters
+            generator = VehicleMaskGenerator(
+                difference_threshold=20.0,
+                static_ratio_threshold=0.8,
+                bottom_region_ratio=0.5,
+                morphology_kernel_size=15
+            )
+
+            mask, stats = generator.generate_mask(
+                image_paths=self.image_files,
+                num_samples=min(10, len(self.image_files))
+            )
+
+            # Save mask
+            cv2.imwrite(str(self.vehicle_mask_path), mask)
+            self.vehicle_mask = mask
+
+            # Create and save visualization
+            sample_img = cv2.imread(str(self.image_files[0]))
+            vis = generator.create_visualization(sample_img, mask)
+            vis_path = self.output_dir / "vehicle_mask_visualization.jpg"
+            cv2.imwrite(str(vis_path), vis)
+
+            # Show statistics
+            ratio = stats['vehicle_ratio_total'] * 100
+            ui.notify(
+                f'✓ Vehicle mask generated! Coverage: {ratio:.1f}%',
+                type='positive'
+            )
+
+            # Apply mask to all images
+            self._apply_vehicle_mask_to_all()
+
+        except Exception as e:
+            ui.notify(f'Error generating vehicle mask: {e}', type='negative')
+            import traceback
+            traceback.print_exc()
+
+    def _apply_vehicle_mask_to_all(self):
+        """Apply vehicle mask to all segmentation images."""
+        if self.vehicle_mask is None:
+            # Try to load existing mask
+            if self.vehicle_mask_path.exists():
+                self.vehicle_mask = cv2.imread(str(self.vehicle_mask_path), cv2.IMREAD_GRAYSCALE)
+            else:
+                ui.notify('No vehicle mask found. Generate one first.', type='warning')
+                return
+
+        # Vehicle mask is saved and will be used during training data export
+        # We do NOT modify segmentation images to preserve original OneFormer results
+        ui.notify(
+            '✓ Vehicle mask ready. It will be applied during data export.',
+            type='positive'
+        )
+
+        # Reload current image
+        self._load_current_image()

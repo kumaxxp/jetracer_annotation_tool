@@ -12,27 +12,47 @@ from tqdm import tqdm
 from data.ade20k_labels import ADE20K_LABELS
 
 
-def generate_binary_mask(seg_image: np.ndarray, road_mapping: dict) -> np.ndarray:
+def generate_multiclass_mask(
+    seg_image: np.ndarray,
+    road_mapping: dict,
+    vehicle_mask: np.ndarray = None
+) -> np.ndarray:
     """
-    Generate binary ROAD mask from ADE20K segmentation and mapping.
+    Generate 3-class mask from ADE20K segmentation and vehicle mask.
 
     Args:
-        seg_image: ADE20K segmentation (H, W) - each pixel is class ID (0-150)
+        seg_image: ADE20K segmentation (H, W) - each pixel is class ID (0-150, 255)
         road_mapping: {label_name: is_road} dictionary
+        vehicle_mask: Vehicle mask (H, W) - 255 where vehicle is present, 0 otherwise
 
     Returns:
-        Binary mask (H, W) - 0: non-ROAD, 255: ROAD
+        Multiclass mask (H, W) with values:
+            0: Other (non-ROAD, non-MYCAR)
+            1: ROAD (drivable area)
+            2: MYCAR (vehicle body)
     """
     mask = np.zeros_like(seg_image, dtype=np.uint8)
 
     # Create reverse mapping: class_id -> label_name
     id_to_name = {class_id: label_name for class_id, label_name in ADE20K_LABELS.items()}
 
-    # Mark ROAD pixels
+    # Mark ROAD pixels (class 1)
     for class_id in np.unique(seg_image):
+        # Skip mycar if present in segmentation
+        if class_id == 255:
+            continue
+
         label_name = id_to_name.get(int(class_id))
         if label_name and road_mapping.get(label_name, False):
-            mask[seg_image == class_id] = 255
+            mask[seg_image == class_id] = 1
+
+    # Mark MYCAR pixels (class 2) using vehicle mask
+    if vehicle_mask is not None:
+        mycar_pixels = vehicle_mask > 127
+        mask[mycar_pixels] = 2
+    # Also check for mycar in segmentation (ID=255)
+    elif 255 in seg_image:
+        mask[seg_image == 255] = 2
 
     return mask
 
@@ -42,7 +62,8 @@ def export_training_data(
     road_mapping: dict,
     output_dir: Path,
     train_ratio: float = 0.8,
-    random_seed: int = 42
+    random_seed: int = 42,
+    vehicle_mask_path: Path = None
 ) -> Tuple[int, int]:
     """
     Export training dataset with train/val split.
@@ -53,10 +74,17 @@ def export_training_data(
         output_dir: Output directory for training data
         train_ratio: Ratio of training data (default: 0.8)
         random_seed: Random seed for reproducibility
+        vehicle_mask_path: Path to vehicle mask PNG (optional)
 
     Returns:
         (num_train, num_val) tuple
     """
+    # Load vehicle mask if provided
+    vehicle_mask = None
+    if vehicle_mask_path and vehicle_mask_path.exists():
+        vehicle_mask = np.array(Image.open(vehicle_mask_path))
+        print(f"✓ Loaded vehicle mask from {vehicle_mask_path}")
+
     # Create output directories
     train_img_dir = output_dir / "train" / "images"
     train_lbl_dir = output_dir / "train" / "labels"
@@ -92,8 +120,8 @@ def export_training_data(
             seg_img = Image.open(seg_path)
             seg_array = np.array(seg_img)
 
-            # Generate binary mask
-            binary_mask = generate_binary_mask(seg_array, road_mapping)
+            # Generate 3-class mask (0: Other, 1: ROAD, 2: MYCAR)
+            multiclass_mask = generate_multiclass_mask(seg_array, road_mapping, vehicle_mask)
 
             # Determine train or val
             is_train = idx in train_indices
@@ -107,8 +135,8 @@ def export_training_data(
             if seg_path.exists():
                 shutil.copy(seg_path, img_dir / f"{image_path.stem}_seg.png")
 
-            # Save binary mask
-            mask_img = Image.fromarray(binary_mask)
+            # Save multiclass mask (values: 0, 1, 2)
+            mask_img = Image.fromarray(multiclass_mask)
             mask_img.save(lbl_dir / f"{image_path.stem}.png")
 
             if is_train:

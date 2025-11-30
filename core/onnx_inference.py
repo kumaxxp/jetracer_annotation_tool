@@ -93,7 +93,7 @@ class ONNXSegmenter:
 
         Returns:
             (mask, inference_time) where:
-                mask: Binary mask (H, W) - 0 or 255, resized to original size
+                mask: Multiclass mask (H, W) - 0: Other, 1: ROAD, 2: MYCAR, resized to original size
                 inference_time: Inference time in milliseconds
         """
         original_h, original_w = image.shape[:2]
@@ -121,24 +121,21 @@ class ONNXSegmenter:
 
     def postprocess(self, output: np.ndarray) -> np.ndarray:
         """
-        Postprocess model output to binary mask.
+        Postprocess model output to multiclass mask.
 
         Args:
-            output: Model output (1, 1, H, W) or (1, H, W) - logits
+            output: Model output (1, 3, H, W) - logits for 3 classes
 
         Returns:
-            Binary mask (H, W) - 0 or 255
+            Multiclass mask (H, W) - 0: Other, 1: ROAD, 2: MYCAR
         """
-        # Remove batch dimension
+        # Remove batch dimension: (1, 3, H, W) -> (3, H, W)
         if output.ndim == 4:
-            logits = output[0, 0]  # (H, W)
-        elif output.ndim == 3:
-            logits = output[0]  # (H, W)
+            logits = output[0]  # (3, H, W)
         else:
             logits = output
 
-        # Apply sigmoid and threshold
-        probs = 1 / (1 + np.exp(-logits))  # Sigmoid
-        mask = (probs > 0.5).astype(np.uint8) * 255
+        # Argmax over class dimension: (3, H, W) -> (H, W)
+        mask = np.argmax(logits, axis=0).astype(np.uint8)
 
         return mask

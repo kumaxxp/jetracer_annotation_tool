@@ -153,7 +153,9 @@ ADE20K_LABELS = {
     147: "radiator",
     148: "glass",
     149: "clock",
-    150: "flag"
+    150: "flag",
+    # Custom labels
+    255: "mycar"  # Vehicle body visible in camera
 }
 
 # Color map for visualization (RGB)
@@ -190,6 +192,8 @@ ADE20K_COLORS = {
     28: (220, 220, 220), # mirror
     29: (255, 9, 92),    # rug
     30: (112, 9, 255),   # field
+    # Custom colors
+    255: (255, 128, 0),  # mycar - orange
 }
 
 def get_label_name(label_id: int) -> str:
