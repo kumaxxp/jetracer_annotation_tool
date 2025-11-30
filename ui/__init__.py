@@ -1,5 +1,10 @@
-"""UI components for the annotation tool."""
+"""UI components for the JetRacer Vision System."""
 
-from .annotation_ui import AnnotationUI
+# Import modules explicitly when needed
+# from .annotation_ui import AnnotationUI
+# from .offline_viewer_ui import OfflineViewerUI
+# from .calibration_ui import CalibrationUI
+# from .depth_test_ui import DepthTestUI
+# from .line_test_ui import LineTestUI
 
-__all__ = ["AnnotationUI"]
+__all__ = []

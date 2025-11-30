@@ -1,0 +1,126 @@
+# config/default.yaml
+# JetRacer Vision System デフォルト設定
+
+# =============================================================================
+# カメラ設定 (Phase 5 で使用)
+# =============================================================================
+cameras:
+  ground:
+    device_id: 0
+    resolution: [640, 480]
+    fps: 15
+    rotation: 0  # 0, 90, 180, 270
+  front:
+    device_id: 1
+    resolution: [640, 480]
+    fps: 15
+    rotation: 0
+
+# =============================================================================
+# 処理設定
+# =============================================================================
+processing:
+  # 足元カメラ: セグメンテーション (既存モデル使用)
+  segmentation:
+    model_path: "output/models/road_segmentation.onnx"
+    input_size: [320, 240]  # width, height
+    use_cuda: false  # CUDA backend has compatibility issues with OpenCV 4.5.4, use CPU
+    classes:
+      OTHER: 0
+      ROAD: 1
+      MYCAR: 2
+
+  # 正面カメラ Mode A: 深度推定
+  depth:
+    enabled: true
+    model_path: "output/models/depth_anything_v2_small.onnx"
+    input_size: [320, 240]
+    use_cuda: false  # Use CPU backend for compatibility
+
+    # 車体基準キャリブレーション
+    vehicle_reference:
+      roi: [240, 420, 400, 480]  # x1, y1, x2, y2 (640x480想定)
+      distance_cm: 5.0           # 車体までの実距離
+
+    # ROI分割 (3x3 + 車体基準)
+    roi_grid:
+      rows: 3
+      cols: 3
+      exclude_bottom_ratio: 0.125  # 下部1/8を車体基準として除外
+
+  # 正面カメラ Mode B: ライン検出
+  line_detection:
+    enabled: true
+
+    # 前処理
+    preprocessing:
+      blur_kernel: 5
+      clahe_clip_limit: 2.0
+      clahe_tile_size: [8, 8]
+
+    # 白線検出 (HSV)
+    white_line:
+      h_range: [0, 180]
+      s_range: [0, 30]
+      v_range: [200, 255]
+
+    # 黄線検出 (HSV)
+    yellow_line:
+      h_range: [20, 40]
+      s_range: [100, 255]
+      v_range: [100, 255]
+
+    # ROI (画面の40%〜90%の高さを使用)
+    roi:
+      top_ratio: 0.4
+      bottom_ratio: 0.9
+
+    # 直線検出パラメータ
+    hough:
+      rho: 1
+      theta_degrees: 1
+      threshold: 50
+      min_line_length: 50
+      max_line_gap: 10
+
+# =============================================================================
+# 判定設定
+# =============================================================================
+decision:
+  # モード選択: "OBSTACLE_AVOIDANCE" or "LINE_FOLLOWING"
+  mode: "OBSTACLE_AVOIDANCE"
+
+  # 障害物回避 (Mode A) 閾値
+  obstacle_avoidance:
+    emergency_stop_cm: 10.0
+    stop_cm: 15.0
+    slow_cm: 30.0
+
+  # 足元セグメンテーション閾値
+  ground:
+    min_drivable_ratio: 0.3  # 30%以上で走行可能
+
+  # ライントレース (Mode B) 設定
+  line_following:
+    steering_gain: 0.5
+    target_point_ratio: 0.7  # 画面上部70%の位置を目標
+
+  # 走行速度
+  speed:
+    base: 0.2
+    slow: 0.1
+
+# =============================================================================
+# UI設定
+# =============================================================================
+ui:
+  theme: "dark"
+  refresh_interval_ms: 100
+
+# =============================================================================
+# ログ設定
+# =============================================================================
+logging:
+  level: "INFO"
+  save_to_file: false
+  file_path: "output/logs/vision.log"
