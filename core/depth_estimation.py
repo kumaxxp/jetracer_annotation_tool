@@ -2,7 +2,7 @@
 深度推定モジュール
 
 Depth Anything V2 Small を使用した単眼深度推定。
-ONNX形式のモデルを使用し、ONNX Runtime または OpenCV DNNバックエンドで推論。
+TensorRT, ONNX Runtime, OpenCV DNNバックエンドで推論。
 """
 
 from pathlib import Path
@@ -10,6 +10,15 @@ from typing import Tuple, Dict, Optional, Any
 import time
 import cv2
 import numpy as np
+
+# Try to import TensorRT + PyCUDA
+try:
+    import tensorrt as trt
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    HAS_TENSORRT = True
+except ImportError:
+    HAS_TENSORRT = False
 
 # Try to import ONNX Runtime
 try:
@@ -57,6 +66,14 @@ class DepthEstimator:
         self.input_name: Optional[str] = None
         self.backend: str = "none"
 
+        # TensorRT specific
+        self.trt_context = None
+        self.trt_engine = None
+        self.d_input = None
+        self.d_output = None
+        self.stream = None
+        self.output_shape = None
+
     def load_model(self) -> bool:
         """
         モデルを読み込む
@@ -64,11 +81,24 @@ class DepthEstimator:
         Returns:
             bool: 読み込み成功した場合True
         """
+        # Check for TensorRT engine first (fastest)
+        engine_path = self.model_path.with_suffix('.engine')
+        if not engine_path.exists():
+            # Try specific naming
+            engine_path = Path(str(self.model_path).replace('.onnx', '_fp16.engine'))
+
+        if engine_path.exists() and HAS_TENSORRT and self.use_cuda:
+            try:
+                return self._load_with_tensorrt(engine_path)
+            except Exception as e:
+                print(f"TensorRT failed: {e}")
+                print("Trying ONNX Runtime backend...")
+
         if not self.model_path.exists():
             print(f"Error: Model file not found: {self.model_path}")
             return False
 
-        # Try ONNX Runtime first (better compatibility)
+        # Try ONNX Runtime (better compatibility)
         if HAS_ONNXRUNTIME:
             try:
                 return self._load_with_onnxruntime()
@@ -82,6 +112,49 @@ class DepthEstimator:
         except Exception as e:
             print(f"OpenCV DNN failed: {e}")
             return False
+
+    def _load_with_tensorrt(self, engine_path: Path) -> bool:
+        """TensorRTエンジンを読み込む"""
+        print(f"Loading TensorRT engine from {engine_path}...")
+
+        # Create logger and runtime
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+
+        # Load engine
+        with open(engine_path, 'rb') as f:
+            self.trt_engine = runtime.deserialize_cuda_engine(f.read())
+
+        self.trt_context = self.trt_engine.create_execution_context()
+
+        # Get input/output info
+        input_name = self.trt_engine.get_tensor_name(0)
+        output_name = self.trt_engine.get_tensor_name(1)
+        input_shape = self.trt_engine.get_tensor_shape(input_name)
+        self.output_shape = self.trt_engine.get_tensor_shape(output_name)
+
+        # Calculate buffer sizes
+        input_size = int(np.prod(input_shape) * np.dtype(np.float32).itemsize)
+        output_size = int(np.prod(self.output_shape) * np.dtype(np.float32).itemsize)
+
+        # Allocate device memory
+        self.d_input = cuda.mem_alloc(input_size)
+        self.d_output = cuda.mem_alloc(output_size)
+
+        # Create CUDA stream
+        self.stream = cuda.Stream()
+
+        # Set tensor addresses
+        self.trt_context.set_tensor_address(input_name, int(self.d_input))
+        self.trt_context.set_tensor_address(output_name, int(self.d_output))
+
+        self.input_name = input_name
+        self.backend = "tensorrt"
+
+        print(f"✓ TensorRT engine loaded successfully")
+        print(f"  Input: {input_name} {input_shape}")
+        print(f"  Output: {output_name} {self.output_shape}")
+        return True
 
     def _load_with_onnxruntime(self) -> bool:
         """ONNX Runtimeでモデルを読み込む"""
@@ -101,9 +174,11 @@ class DepthEstimator:
 
         providers.append('CPUExecutionProvider')
 
-        # Create session
+        # Create session with optimizations
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = 4  # Use 4 threads for operations
+        sess_options.inter_op_num_threads = 2  # Use 2 threads between operations
 
         self.session = ort.InferenceSession(
             str(self.model_path),
@@ -189,7 +264,7 @@ class DepthEstimator:
                 - depth_map: (H, W) float32, 相対深度（大きいほど近い）
                 - inference_time_ms: 推論時間（ミリ秒）
         """
-        if self.session is None:
+        if self.backend == "none":
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         original_h, original_w = image.shape[:2]
@@ -200,7 +275,15 @@ class DepthEstimator:
         # 推論
         start = time.perf_counter()
 
-        if self.backend == "onnxruntime":
+        if self.backend == "tensorrt":
+            # TensorRT inference
+            blob_contiguous = np.ascontiguousarray(blob)
+            cuda.memcpy_htod_async(self.d_input, blob_contiguous, self.stream)
+            self.trt_context.execute_async_v3(stream_handle=self.stream.handle)
+            output = np.empty(self.output_shape, dtype=np.float32)
+            cuda.memcpy_dtoh_async(output, self.d_output, self.stream)
+            self.stream.synchronize()
+        elif self.backend == "onnxruntime":
             outputs = self.session.run(None, {self.input_name: blob})
             output = outputs[0]
         else:  # opencv

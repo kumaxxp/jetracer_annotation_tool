@@ -18,6 +18,7 @@ from core.pytorch_inference import PyTorchSegmenter
 from core.segmentation import SegmentationImage
 from core.mapping import ROADMapping
 from core.depth_estimation import DepthEstimator
+from core.object_detection import ObjectDetector, Detection
 from data.ade20k_labels import ADE20K_COLORS, ADE20K_LABELS
 
 
@@ -46,9 +47,13 @@ class TrainingTestingUI:
         mapping_file = Path("output/road_mapping.json")
         self.road_mapping = ROADMapping(str(mapping_file)) if mapping_file.exists() else None
 
-        # Depth estimator
+        # Depth estimator (kept for reference but not used in main display)
         self.depth_estimator: Optional[DepthEstimator] = None
         self._init_depth_estimator()
+
+        # Object detector (YOLO)
+        self.object_detector: Optional[ObjectDetector] = None
+        self._init_object_detector()
 
         # UI components (created in create_ui)
         self.train_log = None
@@ -56,14 +61,15 @@ class TrainingTestingUI:
         self.test_images_select = None
         self.ade20k_display = None
         self.overlay_display = None
-        self.depth_display = None
+        self.detection_display = None  # Changed from depth_display
         self.inference_time_label = None
-        self.depth_info_label = None
+        self.detection_info_label = None  # Changed from depth_info_label
 
     def _init_depth_estimator(self):
         """Initialize Depth Anything V2 estimator."""
-        # Try to find depth model
+        # Try to find depth model (optimized models first)
         depth_model_paths = [
+            Path("output/models/depth_anything_v2_320x240.onnx"),  # Optimized 320x240 (fastest ONNX)
             Path("/home/jetson/auto_recorder/configs/models/depth_anything_v2_vits_dynamic.onnx"),  # Dynamic (ONNX Runtime)
             Path("output/models/depth_anything_v2_static.onnx"),  # Static shape (OpenCV compatible)
             Path("output/models/depth_anything_v2_small.onnx"),
@@ -75,7 +81,7 @@ class TrainingTestingUI:
                 try:
                     self.depth_estimator = DepthEstimator(
                         model_path=str(model_path),
-                        input_size=(518, 518),  # Depth Anything V2 optimal size
+                        input_size=(320, 240),  # Reduced for faster inference
                         use_cuda=True
                     )
                     if self.depth_estimator.load_model():
@@ -86,6 +92,22 @@ class TrainingTestingUI:
 
         print("⚠ Depth model not found. Depth estimation disabled.")
         self.depth_estimator = None
+
+    def _init_object_detector(self):
+        """Initialize YOLO object detector."""
+        try:
+            self.object_detector = ObjectDetector(
+                model_path="yolov8n.pt",
+                conf_threshold=0.4,
+                use_cuda=True
+            )
+            if self.object_detector.load_model():
+                print("✓ YOLO object detector loaded")
+            else:
+                self.object_detector = None
+        except Exception as e:
+            print(f"Error loading object detector: {e}")
+            self.object_detector = None
 
     def create_ui(self):
         """Create the NiceGUI interface."""
@@ -199,17 +221,17 @@ class TrainingTestingUI:
                     ui.label('Original + Prediction Overlay').classes('text-h6 mb-2')
                     self.overlay_display = ui.interactive_image().classes('w-full')
 
-            # Right: Depth Estimation
+            # Right: Object Detection (YOLO)
             with ui.column().classes('flex-1'):
                 with ui.card():
-                    ui.label('Depth Estimation (Depth Anything V2)').classes('text-h6 mb-2')
-                    self.depth_display = ui.interactive_image().classes('w-full')
-                    self.depth_info_label = ui.label('').classes('text-caption mt-2')
+                    ui.label('Object Detection (YOLOv8)').classes('text-h6 mb-2')
+                    self.detection_display = ui.interactive_image().classes('w-full')
+                    self.detection_info_label = ui.label('').classes('text-caption mt-2')
 
         # Performance metrics
         with ui.card().classes('w-full mt-4'):
             ui.label('Performance Metrics').classes('text-h6 mb-2')
-            self.inference_time_label = ui.label('Segmentation: - | Depth: -').classes('text-bold')
+            self.inference_time_label = ui.label('Segmentation: - | Detection: -').classes('text-bold')
 
     def _start_training(self):
         """Start model training in background thread."""
@@ -408,37 +430,63 @@ class TrainingTestingUI:
             overlay_img = self._create_prediction_overlay(image, pred_mask)
             self._update_display(self.overlay_display, overlay_img)
 
-            # 3. Run depth estimation (right)
-            depth_inference_time = 0.0
-            if self.depth_estimator is not None:
+            # 3. Run object detection (right) - YOLO + Segmentation-based wall detection
+            detection_inference_time = 0.0
+            if self.object_detector is not None:
                 try:
-                    depth_map, depth_inference_time = self.depth_estimator.inference(image)
+                    # YOLO object detection
+                    yolo_detections, detection_inference_time = self.object_detector.detect(image)
 
-                    # Create depth visualization with plasma colormap
-                    depth_colored = self._colorize_depth_map(depth_map)
-                    self._update_display(self.depth_display, depth_colored)
-
-                    # Update depth info
-                    depth_min = depth_map.min()
-                    depth_max = depth_map.max()
-                    depth_mean = depth_map.mean()
-                    self.depth_info_label.set_text(
-                        f'Depth: min={depth_min:.3f}, max={depth_max:.3f}, mean={depth_mean:.3f}'
+                    # Segmentation-based wall/obstacle detection
+                    h, w = image.shape[:2]
+                    wall_detections = self.object_detector.detect_obstacles_from_segmentation(
+                        pred_mask, (h, w)
                     )
+
+                    # Combine all detections
+                    all_detections = yolo_detections + wall_detections
+
+                    # Sort by danger level
+                    danger_order = {'danger': 0, 'caution': 1, 'safe': 2}
+                    all_detections.sort(key=lambda d: (danger_order[d.danger_level], -d.area))
+
+                    # Draw detections on image
+                    detection_img = self.object_detector.draw_detections(image, all_detections)
+                    detection_pil = Image.fromarray(cv2.cvtColor(detection_img, cv2.COLOR_BGR2RGB))
+                    self._update_display(self.detection_display, detection_pil)
+
+                    # Get danger summary
+                    summary = self.object_detector.get_danger_summary(all_detections)
+
+                    # Show detection info
+                    if summary['total'] > 0:
+                        wall_info = " 🧱" if summary['has_wall'] else ""
+                        info_text = (
+                            f"🔴 Danger: {summary['danger_count']} | "
+                            f"🟡 Caution: {summary['caution_count']} | "
+                            f"🟢 Safe: {summary['safe_count']}{wall_info} "
+                            f"{summary['warning']}"
+                        )
+                    else:
+                        info_text = "✓ No obstacles detected"
+                    self.detection_info_label.set_text(info_text)
+
                 except Exception as e:
-                    print(f"Depth estimation error: {e}")
-                    self.depth_info_label.set_text(f'Depth error: {e}')
+                    print(f"Object detection error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.detection_info_label.set_text(f'Detection error: {e}')
             else:
-                self.depth_info_label.set_text('Depth model not loaded')
+                self.detection_info_label.set_text('YOLO model not loaded')
 
             # Update metrics
             seg_fps = 1000.0 / seg_inference_time if seg_inference_time > 0 else 0
-            depth_fps = 1000.0 / depth_inference_time if depth_inference_time > 0 else 0
+            det_fps = 1000.0 / detection_inference_time if detection_inference_time > 0 else 0
             seg_status = "✅" if seg_inference_time < 40 else "⚠️" if seg_inference_time < 66 else "❌"
-            depth_status = "✅" if depth_inference_time < 100 else "⚠️" if depth_inference_time < 200 else "❌"
+            det_status = "✅" if detection_inference_time < 100 else "⚠️" if detection_inference_time < 200 else "❌"
             self.inference_time_label.set_text(
                 f'{seg_status} Seg: {seg_inference_time:.1f}ms ({seg_fps:.1f}fps) | '
-                f'{depth_status} Depth: {depth_inference_time:.1f}ms ({depth_fps:.1f}fps)'
+                f'{det_status} YOLO: {detection_inference_time:.1f}ms ({det_fps:.1f}fps)'
             )
 
         except Exception as e:
@@ -507,7 +555,12 @@ class TrainingTestingUI:
 
     def _colorize_depth_map(self, depth_map: np.ndarray) -> Image.Image:
         """
-        Colorize depth map using plasma colormap.
+        Colorize depth map with danger zone highlighting for collision avoidance.
+
+        Color scheme:
+        - Red: Close (danger, collision risk)
+        - Yellow: Medium distance (caution)
+        - Green/Blue: Far (safe)
 
         Args:
             depth_map: Normalized depth map (0-1, higher = closer)
@@ -519,14 +572,50 @@ class TrainingTestingUI:
         if depth_map.ndim == 3:
             depth_map = depth_map[:, :, 0]
 
-        # Convert to 0-255 range
+        # 1. Contrast enhancement using histogram equalization
         depth_uint8 = (depth_map * 255).astype(np.uint8)
+        depth_enhanced = cv2.equalizeHist(depth_uint8)
 
-        # Apply plasma colormap (COLORMAP_PLASMA: purple->yellow, closer=brighter)
-        # Invert so that closer objects appear brighter/warmer
-        depth_colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_PLASMA)
+        # Convert back to 0-1 range
+        depth_normalized = depth_enhanced.astype(np.float32) / 255.0
 
-        # Convert BGR to RGB for PIL
-        depth_rgb = cv2.cvtColor(depth_colored, cv2.COLOR_BGR2RGB)
+        # 2. Create danger zone colormap (Red-Yellow-Green-Blue)
+        h, w = depth_normalized.shape
+        colored = np.zeros((h, w, 3), dtype=np.uint8)
 
-        return Image.fromarray(depth_rgb)
+        # Define thresholds (after histogram equalization)
+        # Higher value = closer object
+        danger_thresh = 0.70   # Red zone (collision risk)
+        caution_thresh = 0.45  # Yellow zone (caution)
+        safe_thresh = 0.25     # Green zone (safe)
+        # Below safe_thresh = Blue zone (very far)
+
+        # Danger zone (red) - closest objects
+        danger_mask = depth_normalized >= danger_thresh
+        danger_intensity = np.clip((depth_normalized - danger_thresh) / (1.0 - danger_thresh), 0, 1)
+        colored[danger_mask, 0] = 255  # R
+        colored[danger_mask, 1] = (50 * (1 - danger_intensity[danger_mask])).astype(np.uint8)  # G (slight yellow tint for gradient)
+        colored[danger_mask, 2] = 0    # B
+
+        # Caution zone (yellow to orange)
+        caution_mask = (depth_normalized >= caution_thresh) & (depth_normalized < danger_thresh)
+        caution_intensity = (depth_normalized[caution_mask] - caution_thresh) / (danger_thresh - caution_thresh)
+        colored[caution_mask, 0] = 255  # R
+        colored[caution_mask, 1] = (255 * (1 - caution_intensity * 0.7)).astype(np.uint8)  # G (yellow to orange)
+        colored[caution_mask, 2] = 0    # B
+
+        # Safe zone (green)
+        safe_mask = (depth_normalized >= safe_thresh) & (depth_normalized < caution_thresh)
+        safe_intensity = (depth_normalized[safe_mask] - safe_thresh) / (caution_thresh - safe_thresh)
+        colored[safe_mask, 0] = (100 * safe_intensity).astype(np.uint8)  # R (slight yellow tint)
+        colored[safe_mask, 1] = 255  # G
+        colored[safe_mask, 2] = (50 * (1 - safe_intensity)).astype(np.uint8)  # B
+
+        # Very far zone (blue-green)
+        far_mask = depth_normalized < safe_thresh
+        far_intensity = depth_normalized[far_mask] / safe_thresh
+        colored[far_mask, 0] = 0    # R
+        colored[far_mask, 1] = (200 * far_intensity).astype(np.uint8)  # G
+        colored[far_mask, 2] = (255 * (1 - far_intensity * 0.5)).astype(np.uint8)  # B
+
+        return Image.fromarray(colored)
