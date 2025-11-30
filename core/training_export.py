@@ -103,6 +103,10 @@ def export_training_data(
             # Copy original image
             shutil.copy(image_path, img_dir / image_path.name)
 
+            # Copy segmentation image if exists
+            if seg_path.exists():
+                shutil.copy(seg_path, img_dir / f"{image_path.stem}_seg.png")
+
             # Save binary mask
             mask_img = Image.fromarray(binary_mask)
             mask_img.save(lbl_dir / f"{image_path.stem}.png")
