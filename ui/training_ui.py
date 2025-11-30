@@ -17,6 +17,7 @@ from core.onnx_inference import ONNXSegmenter
 from core.pytorch_inference import PyTorchSegmenter
 from core.segmentation import SegmentationImage
 from core.mapping import ROADMapping
+from core.depth_estimation import DepthEstimator
 from data.ade20k_labels import ADE20K_COLORS, ADE20K_LABELS
 
 
@@ -45,14 +46,46 @@ class TrainingTestingUI:
         mapping_file = Path("output/road_mapping.json")
         self.road_mapping = ROADMapping(str(mapping_file)) if mapping_file.exists() else None
 
+        # Depth estimator
+        self.depth_estimator: Optional[DepthEstimator] = None
+        self._init_depth_estimator()
+
         # UI components (created in create_ui)
         self.train_log = None
         self.train_button = None
         self.test_images_select = None
         self.ade20k_display = None
         self.overlay_display = None
-        self.prediction_display = None
+        self.depth_display = None
         self.inference_time_label = None
+        self.depth_info_label = None
+
+    def _init_depth_estimator(self):
+        """Initialize Depth Anything V2 estimator."""
+        # Try to find depth model
+        depth_model_paths = [
+            Path("/home/jetson/auto_recorder/configs/models/depth_anything_v2_vits_dynamic.onnx"),  # Dynamic (ONNX Runtime)
+            Path("output/models/depth_anything_v2_static.onnx"),  # Static shape (OpenCV compatible)
+            Path("output/models/depth_anything_v2_small.onnx"),
+            Path("models/depth_anything_v2_small.onnx"),
+        ]
+
+        for model_path in depth_model_paths:
+            if model_path.exists():
+                try:
+                    self.depth_estimator = DepthEstimator(
+                        model_path=str(model_path),
+                        input_size=(518, 518),  # Depth Anything V2 optimal size
+                        use_cuda=True
+                    )
+                    if self.depth_estimator.load_model():
+                        print(f"✓ Depth model loaded: {model_path}")
+                        return
+                except Exception as e:
+                    print(f"Error loading depth model: {e}")
+
+        print("⚠ Depth model not found. Depth estimation disabled.")
+        self.depth_estimator = None
 
     def create_ui(self):
         """Create the NiceGUI interface."""
@@ -166,16 +199,17 @@ class TrainingTestingUI:
                     ui.label('Original + Prediction Overlay').classes('text-h6 mb-2')
                     self.overlay_display = ui.interactive_image().classes('w-full')
 
-            # Right: Prediction Mask
+            # Right: Depth Estimation
             with ui.column().classes('flex-1'):
                 with ui.card():
-                    ui.label('Prediction Mask').classes('text-h6 mb-2')
-                    self.prediction_display = ui.interactive_image().classes('w-full')
+                    ui.label('Depth Estimation (Depth Anything V2)').classes('text-h6 mb-2')
+                    self.depth_display = ui.interactive_image().classes('w-full')
+                    self.depth_info_label = ui.label('').classes('text-caption mt-2')
 
         # Performance metrics
         with ui.card().classes('w-full mt-4'):
             ui.label('Performance Metrics').classes('text-h6 mb-2')
-            self.inference_time_label = ui.label('Inference time: -').classes('text-bold')
+            self.inference_time_label = ui.label('Segmentation: - | Depth: -').classes('text-bold')
 
     def _start_training(self):
         """Start model training in background thread."""
@@ -368,21 +402,43 @@ class TrainingTestingUI:
                 segmenter = ONNXSegmenter(str(self.model_path), input_size=(320, 240))
 
             image = cv2.imread(str(img_path))
-            pred_mask, inference_time = segmenter.inference(image)
-
-            # Display prediction mask (right)
-            pred_colored = self._colorize_binary_mask(pred_mask)
-            self._update_display(self.prediction_display, pred_colored)
+            pred_mask, seg_inference_time = segmenter.inference(image)
 
             # Create and display original + prediction overlay (middle)
             overlay_img = self._create_prediction_overlay(image, pred_mask)
             self._update_display(self.overlay_display, overlay_img)
 
+            # 3. Run depth estimation (right)
+            depth_inference_time = 0.0
+            if self.depth_estimator is not None:
+                try:
+                    depth_map, depth_inference_time = self.depth_estimator.inference(image)
+
+                    # Create depth visualization with plasma colormap
+                    depth_colored = self._colorize_depth_map(depth_map)
+                    self._update_display(self.depth_display, depth_colored)
+
+                    # Update depth info
+                    depth_min = depth_map.min()
+                    depth_max = depth_map.max()
+                    depth_mean = depth_map.mean()
+                    self.depth_info_label.set_text(
+                        f'Depth: min={depth_min:.3f}, max={depth_max:.3f}, mean={depth_mean:.3f}'
+                    )
+                except Exception as e:
+                    print(f"Depth estimation error: {e}")
+                    self.depth_info_label.set_text(f'Depth error: {e}')
+            else:
+                self.depth_info_label.set_text('Depth model not loaded')
+
             # Update metrics
-            fps = 1000.0 / inference_time if inference_time > 0 else 0
-            status = "✅" if inference_time < 40 else "⚠️" if inference_time < 66 else "❌"
+            seg_fps = 1000.0 / seg_inference_time if seg_inference_time > 0 else 0
+            depth_fps = 1000.0 / depth_inference_time if depth_inference_time > 0 else 0
+            seg_status = "✅" if seg_inference_time < 40 else "⚠️" if seg_inference_time < 66 else "❌"
+            depth_status = "✅" if depth_inference_time < 100 else "⚠️" if depth_inference_time < 200 else "❌"
             self.inference_time_label.set_text(
-                f'{status} Inference time: {inference_time:.1f}ms ({fps:.1f} FPS)'
+                f'{seg_status} Seg: {seg_inference_time:.1f}ms ({seg_fps:.1f}fps) | '
+                f'{depth_status} Depth: {depth_inference_time:.1f}ms ({depth_fps:.1f}fps)'
             )
 
         except Exception as e:
@@ -448,3 +504,29 @@ class TrainingTestingUI:
         img.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode()
         display_widget.set_source(f'data:image/png;base64,{img_str}')
+
+    def _colorize_depth_map(self, depth_map: np.ndarray) -> Image.Image:
+        """
+        Colorize depth map using plasma colormap.
+
+        Args:
+            depth_map: Normalized depth map (0-1, higher = closer)
+
+        Returns:
+            PIL Image with colorized depth
+        """
+        # Ensure depth_map is 2D
+        if depth_map.ndim == 3:
+            depth_map = depth_map[:, :, 0]
+
+        # Convert to 0-255 range
+        depth_uint8 = (depth_map * 255).astype(np.uint8)
+
+        # Apply plasma colormap (COLORMAP_PLASMA: purple->yellow, closer=brighter)
+        # Invert so that closer objects appear brighter/warmer
+        depth_colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_PLASMA)
+
+        # Convert BGR to RGB for PIL
+        depth_rgb = cv2.cvtColor(depth_colored, cv2.COLOR_BGR2RGB)
+
+        return Image.fromarray(depth_rgb)
